@@ -96,6 +96,35 @@ pub fn accepts_gzip(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `Accept-Encoding` admits `coding`: the coding listed by name
+/// (case-insensitive) with a non-zero `q`, or, when it is not listed, a
+/// non-zero `*`.  `br;q=0` is a refusal, not a match.
+pub fn accepts_encoding(headers: &HeaderMap, coding: &str) -> bool {
+    let Some(value) = headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let mut wildcard = None;
+    for item in value.split(',') {
+        let mut parts = item.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        // A missing `q` is 1; one that does not parse is treated as a refusal.
+        let acceptable = parts
+            .find_map(|param| {
+                let (key, q) = param.split_once('=')?;
+                key.trim().eq_ignore_ascii_case("q").then(|| q.trim())
+            })
+            .map(|q| q.parse::<f32>().map(|q| q > 0.0).unwrap_or(false))
+            .unwrap_or(true);
+        if name.eq_ignore_ascii_case(coding) {
+            return acceptable;
+        }
+        if name == "*" {
+            wildcard = Some(acceptable);
+        }
+    }
+    wildcard.unwrap_or(false)
+}
+
 fn gzip(data: &[u8]) -> Option<Vec<u8>> {
     // Level 1: game assets are already deflate-compressed inside the GRF, so
     // the wire saving comes cheap or not at all.  Spending 40 ms on level 6 for
@@ -369,6 +398,27 @@ mod tests {
         let mut star = HeaderMap::new();
         star.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
         assert!(etag_matches(&star, "anything"));
+    }
+
+    #[test]
+    fn accept_encoding_is_matched_by_token_and_honours_q_zero() {
+        let accepts = |value: &'static str, coding: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(value));
+            accepts_encoding(&headers, coding)
+        };
+        assert!(accepts("gzip, deflate, br", "br"));
+        assert!(accepts("gzip, deflate, br", "gzip"));
+        assert!(accepts("BR;q=0.5", "br"));
+        assert!(!accepts("br;q=0, gzip", "br"));
+        assert!(!accepts("br; q=0.000", "br"));
+        assert!(accepts("br; q=0.001", "br"));
+        assert!(!accepts("brotli, gzipx", "br"));
+        assert!(!accepts("brotli, gzipx", "gzip"));
+        assert!(accepts("*", "br"));
+        assert!(!accepts("*, br;q=0", "br"));
+        assert!(!accepts("identity", "gzip"));
+        assert!(!accepts_encoding(&HeaderMap::new(), "gzip"));
     }
 
     #[test]
