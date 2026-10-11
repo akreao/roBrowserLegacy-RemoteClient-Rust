@@ -16,6 +16,15 @@
 //! Cache-Control and Set-Cookie headers and at most 64 KiB of body, and
 //! nothing else -- no redirects are followed. A target that does not answer
 //! within five seconds is a 502.
+//!
+//! The same forwarding carries guild emblems to rAthena's web-server, which
+//! keeps them: the client posts to `/emblem/upload` and `/emblem/download` on
+//! the origin it was loaded from. Off unless set:
+//!
+//!   WEB_SERVER_TARGET  `127.0.0.1:<port>` of the web-server (loopback only)
+//!
+//! Only those two paths go there, and up to 64 KiB of request, since an emblem
+//! may be 50 KB (src/web/emblem_controller.cpp, MAX_EMBLEM_SIZE).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -31,6 +40,9 @@ use crate::routes::AppState;
 use crate::warn;
 
 pub const MAX_REQUEST_BODY: usize = 4 * 1024;
+pub const MAX_WEB_SERVER_REQUEST_BODY: usize = 64 * 1024;
+/// What rAthena's web-server answers that the client asks for.
+pub const WEB_SERVER_ROUTES: [&str; 2] = ["/emblem/upload", "/emblem/download"];
 pub const MAX_RESPONSE: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -75,6 +87,40 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     let Some((prefix, target)) = state.cfg.app_proxy.clone() else {
         return crate::http::not_found();
     };
+    relay(
+        request,
+        &target,
+        |path| path.starts_with(&prefix),
+        MAX_REQUEST_BODY,
+        "The app",
+    )
+    .await
+}
+
+/// Guild emblems, to and from rAthena's web-server.
+pub async fn forward_web_server(State(state): State<AppState>, request: Request) -> Response {
+    let Some(target) = state.cfg.web_server_proxy.clone() else {
+        return crate::http::not_found();
+    };
+    relay(
+        request,
+        &target,
+        |path| WEB_SERVER_ROUTES.contains(&path),
+        MAX_WEB_SERVER_REQUEST_BODY,
+        "The web server",
+    )
+    .await
+}
+
+/// POST `request` on to `target`, if `allowed` takes its path, with at most
+/// `max_body` bytes of body. `who` names the target in a 502.
+async fn relay(
+    request: Request,
+    target: &str,
+    allowed: impl Fn(&str) -> bool,
+    max_body: usize,
+    who: &str,
+) -> Response {
     if request.method() != Method::POST {
         return crate::http::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
     }
@@ -88,11 +134,11 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
-    if !path.starts_with(&prefix) || path.bytes().any(|b| b <= b' ' || b == 0x7f) {
+    if !allowed(&path) || path.bytes().any(|b| b <= b' ' || b == 0x7f) {
         return crate::http::not_found();
     }
     let headers = request.headers().clone();
-    let body = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BODY).await {
+    let body = match axum::body::to_bytes(request.into_body(), max_body).await {
         Ok(body) => body,
         Err(_) => return crate::http::text(StatusCode::PAYLOAD_TOO_LARGE, "Request too large"),
     };
@@ -111,7 +157,7 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
     head += "\r\n";
 
     let exchange = async {
-        let mut stream = TcpStream::connect(&target).await?;
+        let mut stream = TcpStream::connect(target).await?;
         stream.write_all(head.as_bytes()).await?;
         stream.write_all(&body).await?;
         let mut answer = Vec::new();
@@ -125,20 +171,54 @@ pub async fn forward(State(state): State<AppState>, request: Request) -> Respons
             if answer.len() > MAX_RESPONSE {
                 return Err(std::io::Error::other("response too large"));
             }
+            // The answer is whole once its Content-Length has arrived. The
+            // connection need not close then, despite `Connection: close`:
+            // rAthena's web-server, reached through the app's port forward,
+            // leaves it open, and reading on to the close would end in the
+            // timeout above with the answer already in hand.
+            if is_complete(&answer) {
+                break;
+            }
         }
         Ok::<_, std::io::Error>(answer)
     };
     let answer = match tokio::time::timeout(TIMEOUT, exchange).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(e)) => {
-            warn!("App proxy to {target} failed: {e}");
-            return crate::http::text(StatusCode::BAD_GATEWAY, "The app did not answer");
+            warn!("Proxy to {target} failed: {e}");
+            return crate::http::text(StatusCode::BAD_GATEWAY, format!("{who} did not answer"));
         }
-        Err(_) => return crate::http::text(StatusCode::BAD_GATEWAY, "The app did not answer"),
+        Err(_) => {
+            return crate::http::text(StatusCode::BAD_GATEWAY, format!("{who} did not answer"))
+        }
     };
     parse_response(&answer).unwrap_or_else(|| {
-        crate::http::text(StatusCode::BAD_GATEWAY, "The app gave an unreadable answer")
+        crate::http::text(
+            StatusCode::BAD_GATEWAY,
+            format!("{who} gave an unreadable answer"),
+        )
     })
+}
+
+/// Whether `raw` holds a whole answer: its head, and as much body as its
+/// Content-Length says. One without a Content-Length is read to the close.
+fn is_complete(raw: &[u8]) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..end]) else {
+        return false;
+    };
+    head.split("\r\n")
+        .skip(1)
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .is_some_and(|length| raw.len() >= end + 4 + length)
 }
 
 /// An HTTP/1.x answer with a Content-Length (or read to close), reduced to the
@@ -187,6 +267,17 @@ pub fn parse_response(raw: &[u8]) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_is_complete_once_its_content_length_is_in() {
+        let whole =
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 5\r\n\r\nError";
+        assert!(is_complete(whole));
+        assert!(!is_complete(&whole[..whole.len() - 1]));
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"));
+        // Without a length, only the close says it is over.
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\n\r\nabc"));
+    }
 
     #[test]
     fn only_tidy_prefixes_that_are_not_ours() {
