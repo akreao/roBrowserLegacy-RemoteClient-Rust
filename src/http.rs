@@ -125,10 +125,88 @@ pub fn accepts_encoding(headers: &HeaderMap, coding: &str) -> bool {
     wildcard.unwrap_or(false)
 }
 
+/// A content coding the server makes for game assets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coding {
+    Br,
+    Gzip,
+}
+
+impl Coding {
+    pub fn name(self) -> &'static str {
+        match self {
+            Coding::Br => "br",
+            Coding::Gzip => "gzip",
+        }
+    }
+}
+
+/// Gzip level for game assets.  The result is kept with the cached file, so
+/// it is paid once per file rather than once per request: level 6 makes the
+/// `.lub` tables about a third smaller than level 1, at about 60 MB/s.
+const ASSET_GZIP_LEVEL: u32 = 6;
+/// Brotli quality and window for game assets.  Quality 5 is where brotli
+/// stops getting much smaller for what it costs: half the size of level-1
+/// gzip on the text tables, at about the speed of gzip level 6.
+const ASSET_BROTLI_QUALITY: u32 = 5;
+const ASSET_BROTLI_WINDOW: u32 = 22;
+
+/// True when `path` is a game asset worth compressing, so its answer depends
+/// on `Accept-Encoding` whether or not this client gets it compressed.
+pub fn negotiates_coding(path: &str, len: usize, compression_enabled: bool) -> bool {
+    let ext = extension_of(path);
+    compression_enabled
+        && len >= COMPRESSION_THRESHOLD
+        && is_compressible(&ext, content_type_for(&ext))
+}
+
+/// The coding to send `path` in, or `None` for its bytes as they are.
+/// Browsers offer `br` only over HTTPS, so a player on the LAN gets gzip.
+pub fn asset_coding(
+    request_headers: &HeaderMap,
+    path: &str,
+    len: usize,
+    compression_enabled: bool,
+) -> Option<Coding> {
+    if !negotiates_coding(path, len, compression_enabled) {
+        return None;
+    }
+    [Coding::Br, Coding::Gzip]
+        .into_iter()
+        .find(|coding| accepts_encoding(request_headers, coding.name()))
+}
+
+/// `data` in `coding`, or `None` when that is not smaller.  Tens of
+/// milliseconds for a large table, so call it off the async workers.
+pub fn encode_asset(coding: Coding, data: &[u8]) -> Option<Vec<u8>> {
+    let encoded = match coding {
+        Coding::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(ASSET_GZIP_LEVEL));
+            encoder.write_all(data).ok()?;
+            encoder.finish().ok()?
+        }
+        Coding::Br => {
+            let mut out = Vec::new();
+            {
+                let mut writer = brotli::CompressorWriter::new(
+                    &mut out,
+                    4096,
+                    ASSET_BROTLI_QUALITY,
+                    ASSET_BROTLI_WINDOW,
+                );
+                writer.write_all(data).ok()?;
+                writer.flush().ok()?;
+            }
+            out
+        }
+    };
+    (encoded.len() < data.len()).then_some(encoded)
+}
+
 fn gzip(data: &[u8]) -> Option<Vec<u8>> {
-    // Level 1: game assets are already deflate-compressed inside the GRF, so
-    // the wire saving comes cheap or not at all.  Spending 40 ms on level 6 for
-    // a sprite the client wanted five milliseconds ago is a bad trade.
+    // Level 1, for responses made per request (JSON, the landing page): they
+    // are not kept, so each one pays.  Game assets go through `encode_asset`,
+    // whose result is kept with the cached file.
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(1));
     encoder.write_all(data).ok()?;
     encoder.finish().ok()
@@ -146,14 +224,18 @@ pub fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|candidate| candidate == quoted || candidate == "*")
 }
 
-/// Build the response for a resolved asset, honouring conditional requests and
-/// negotiating compression.
+/// Build the response for a resolved asset, honouring conditional requests.
+///
+/// `encoded` is the body already in the coding [`asset_coding`] chose, when
+/// that came out smaller; `vary` is [`negotiates_coding`], so a cache keeps
+/// the encoded and plain bodies apart even when this one is plain.
 pub fn asset_response(
     request_headers: &HeaderMap,
     path: &str,
     data: &[u8],
     etag: Option<&str>,
-    compression_enabled: bool,
+    vary: bool,
+    encoded: Option<(Coding, &[u8])>,
 ) -> Response {
     let ext = extension_of(path);
     let content_type = content_type_for(&ext);
@@ -188,25 +270,16 @@ pub fn asset_response(
         builder = builder.header(CACHE_CONTROL, "no-cache, no-store, must-revalidate");
     }
 
-    let compress = compression_enabled
-        && data.len() >= COMPRESSION_THRESHOLD
-        && is_compressible(&ext, content_type)
-        && accepts_gzip(request_headers);
-
-    if compress {
-        if let Some(gz) = gzip(data) {
-            // Only worth it if it actually got smaller.
-            if gz.len() < data.len() {
-                return builder
-                    .header(CONTENT_ENCODING, "gzip")
-                    .header(VARY, "Accept-Encoding")
-                    .body(Body::from(gz))
-                    .unwrap();
-            }
-        }
+    if vary {
+        builder = builder.header(VARY, "Accept-Encoding");
     }
-
-    builder.body(Body::from(data.to_vec())).unwrap()
+    match encoded {
+        Some((coding, body)) => builder
+            .header(CONTENT_ENCODING, coding.name())
+            .body(Body::from(body.to_vec()))
+            .unwrap(),
+        None => builder.body(Body::from(data.to_vec())).unwrap(),
+    }
 }
 
 pub fn not_modified(etag: &str) -> Response {

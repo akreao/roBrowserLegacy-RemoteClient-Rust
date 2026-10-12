@@ -12,6 +12,7 @@ use crate::cache::{CacheStats, CachedFile, FileCache};
 use crate::config::Config;
 use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake};
 use crate::grf::Grf;
+use crate::http::{encode_asset, Coding};
 use crate::index::{norm_forward, AssetIndex};
 use crate::util::{confined_file, iso_now, public_asset_path, safe_join};
 use crate::{debug, error, warn};
@@ -223,6 +224,40 @@ impl Client {
         tokio::task::spawn_blocking(move || this.resolve(&path).map(|(f, _)| f))
             .await
             .unwrap_or(None)
+    }
+
+    /// `file`'s bytes in `coding`, made once and kept with the cached entry;
+    /// `None` when that coding does not make it smaller.
+    pub async fn encoded(
+        self: &Arc<Self>,
+        req_path: &str,
+        file: &CachedFile,
+        coding: Coding,
+    ) -> Option<Arc<Vec<u8>>> {
+        if let Some(done) = file.encodings.slot(coding).get() {
+            return done.clone();
+        }
+        let this = Arc::clone(self);
+        let key = Self::cache_key(req_path);
+        let file = file.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut made = None;
+            let result = file
+                .encodings
+                .slot(coding)
+                .get_or_init(|| {
+                    let encoded = encode_asset(coding, &file.data).map(Arc::new);
+                    made = encoded.as_ref().map(|e| e.len());
+                    encoded
+                })
+                .clone();
+            if let Some(bytes) = made {
+                this.cache.add_encoding(&key, &file, bytes);
+            }
+            result
+        })
+        .await
+        .unwrap_or(None)
     }
 
     /// Write an extracted asset out beside the server so the next request for

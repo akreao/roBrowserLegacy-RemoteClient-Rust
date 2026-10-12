@@ -7,23 +7,47 @@
 //!
 //! The ETag is computed once, when the entry is stored, and handed back with
 //! the bytes.  Hashing 5 MB of sprite on every conditional request is the kind
-//! of cost that only shows up under load.
+//! of cost that only shows up under load.  The same goes for the wire
+//! encodings: each is made the first time a client asks for it, kept with the
+//! entry, and counted against the memory budget like the bytes themselves.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use md5::{Digest, Md5};
+
+use crate::http::Coding;
 
 #[derive(Clone)]
 pub struct CachedFile {
     pub data: Arc<Vec<u8>>,
     pub etag: Arc<str>,
+    pub encodings: Arc<Encodings>,
+}
+
+/// One file's bytes in each content coding, made on first use.  The inner
+/// `None` means it was tried and came out no smaller.
+#[derive(Default)]
+pub struct Encodings {
+    br: OnceLock<Option<Arc<Vec<u8>>>>,
+    gzip: OnceLock<Option<Arc<Vec<u8>>>>,
+}
+
+impl Encodings {
+    pub fn slot(&self, coding: Coding) -> &OnceLock<Option<Arc<Vec<u8>>>> {
+        match coding {
+            Coding::Br => &self.br,
+            Coding::Gzip => &self.gzip,
+        }
+    }
 }
 
 struct Entry {
     data: Arc<Vec<u8>>,
     etag: Arc<str>,
+    encodings: Arc<Encodings>,
+    /// Bytes of `data` plus the encodings made so far.
     size: usize,
     seq: u64,
 }
@@ -88,6 +112,7 @@ impl FileCache {
         let hit = CachedFile {
             data: entry.data.clone(),
             etag: entry.etag.clone(),
+            encodings: entry.encodings.clone(),
         };
         inner.next_seq += 1;
         inner.order.remove(&old_seq);
@@ -104,9 +129,11 @@ impl FileCache {
         let etag: Arc<str> = Arc::from(compute_etag(&data));
         let size = data.len();
 
+        let encodings = Arc::new(Encodings::default());
         let file = CachedFile {
             data: data.clone(),
             etag: etag.clone(),
+            encodings: encodings.clone(),
         };
 
         // One file must not be allowed to own the whole budget.
@@ -121,19 +148,10 @@ impl FileCache {
             inner.order.remove(&old.seq);
         }
 
-        while (inner.map.len() >= self.max_size
-            || inner.current_memory + size > self.max_memory_bytes)
-            && !inner.map.is_empty()
-        {
-            let Some((&oldest_seq, oldest_key)) = inner.order.iter().next() else {
-                break;
-            };
-            let oldest_key = oldest_key.clone();
-            inner.order.remove(&oldest_seq);
-            if let Some(removed) = inner.map.remove(&oldest_key) {
-                inner.current_memory -= removed.size;
-            }
+        while inner.map.len() >= self.max_size && !inner.map.is_empty() {
+            Self::evict_oldest(&mut inner);
         }
+        self.evict_for(&mut inner, size);
 
         let seq = inner.next_seq;
         inner.next_seq += 1;
@@ -143,6 +161,7 @@ impl FileCache {
             Entry {
                 data,
                 etag,
+                encodings,
                 size,
                 seq,
             },
@@ -150,6 +169,46 @@ impl FileCache {
         inner.current_memory += size;
 
         file
+    }
+
+    /// Count `bytes` of a newly made encoding of `file` against the budget,
+    /// if `file` is still the entry cached under `key`.
+    pub fn add_encoding(&self, key: &str, file: &CachedFile, bytes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.map.get(key) {
+            Some(entry) if Arc::ptr_eq(&entry.encodings, &file.encodings) => {}
+            _ => return,
+        }
+        // Make room first, so the entry being grown is never the one evicted:
+        // it was just used, so it is the newest.
+        if let Some(entry) = inner.map.get_mut(key) {
+            entry.size += bytes;
+            let seq = entry.seq;
+            inner.order.remove(&seq);
+            inner.current_memory += bytes;
+            while inner.current_memory > self.max_memory_bytes && !inner.order.is_empty() {
+                Self::evict_oldest(&mut inner);
+            }
+            inner.order.insert(seq, key.to_string());
+        }
+    }
+
+    /// Evict until `incoming` more bytes fit in the memory budget.
+    fn evict_for(&self, inner: &mut Inner, incoming: usize) {
+        while inner.current_memory + incoming > self.max_memory_bytes && !inner.map.is_empty() {
+            Self::evict_oldest(inner);
+        }
+    }
+
+    fn evict_oldest(inner: &mut Inner) {
+        let Some((&oldest_seq, oldest_key)) = inner.order.iter().next() else {
+            return;
+        };
+        let oldest_key = oldest_key.clone();
+        inner.order.remove(&oldest_seq);
+        if let Some(removed) = inner.map.remove(&oldest_key) {
+            inner.current_memory -= removed.size;
+        }
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -275,5 +334,28 @@ mod tests {
         cache.insert("a", blob(2000, 2));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.memory_used(), 2000);
+    }
+
+    #[test]
+    fn an_encoding_counts_against_the_budget_and_leaves_with_its_entry() {
+        let cache = FileCache::new(10, 1);
+        let file = cache.insert("a", blob(1000, 1));
+        cache.add_encoding("a", &file, 300);
+        assert_eq!(cache.memory_used(), 1300);
+        // Replaced, then the old file's late encoding is not counted.
+        cache.insert("a", blob(2000, 2));
+        cache.add_encoding("a", &file, 300);
+        assert_eq!(cache.memory_used(), 2000);
+    }
+
+    #[test]
+    fn growing_an_entry_evicts_others_but_not_itself() {
+        let cache = FileCache::new(10, 1); // 1 MB budget
+        cache.insert("old", blob(90 * 1024, 1));
+        let file = cache.insert("new", blob(90 * 1024, 2));
+        cache.add_encoding("new", &file, 900 * 1024);
+        assert!(cache.get("old").is_none());
+        assert!(cache.get("new").is_some());
+        assert_eq!(cache.memory_used(), 990 * 1024);
     }
 }

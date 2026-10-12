@@ -34,6 +34,9 @@ httpdate = "1"
 # potentially reused control port. Use audited primitives, not custom crypto.
 hmac = "0.12"
 sha2 = "0.10"
+# Brotli for game assets sent through the HTTPS sharing tunnel, where
+# browsers offer it. Pure Rust, like flate2's backend.
+brotli = { version = "8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "fs"] }

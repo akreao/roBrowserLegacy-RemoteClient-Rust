@@ -226,6 +226,39 @@ async fn a_client_that_does_not_accept_gzip_gets_plain_bytes() {
 }
 
 #[tokio::test]
+async fn a_client_that_offers_br_gets_brotli_and_the_same_bytes_each_time() {
+    let (_dir, server) = server(&[]).await;
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let response = request(
+            server.addr,
+            "GET",
+            "/data/big.spr",
+            &[("Accept-Encoding", "gzip, deflate, br")],
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header("content-encoding"), Some("br"));
+        assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+        bodies.push(response.body);
+    }
+    // The second answer comes from the encoding kept with the cached file.
+    assert_eq!(bodies[0], bodies[1]);
+    let mut decoded = Vec::new();
+    brotli::BrotliDecompress(&mut bodies[0].as_slice(), &mut decoded).unwrap();
+    assert_eq!(decoded, vec![0x11u8; 40_000]);
+}
+
+#[tokio::test]
+async fn a_plain_answer_to_a_compressible_asset_still_varies_on_accept_encoding() {
+    let (_dir, server) = server(&[]).await;
+    let response = request(server.addr, "GET", "/data/big.spr", &[], None).await;
+    assert_eq!(response.header("content-encoding"), None);
+    assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+}
+
+#[tokio::test]
 async fn head_returns_the_headers_without_the_body() {
     let (_dir, server) = server(&[]).await;
     let response = request(server.addr, "HEAD", "/data/hello.txt", &[], None).await;
