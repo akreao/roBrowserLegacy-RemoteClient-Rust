@@ -2,12 +2,15 @@
 //! asset resolution, and asset resolution is the fallback for everything else.
 
 use std::collections::BTreeMap;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{ws::WebSocketUpgrade, Path, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, LAST_MODIFIED};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, LAST_MODIFIED, VARY,
+};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -394,8 +397,47 @@ async fn serve_root(state: &AppState, headers: &HeaderMap) -> Response {
     )
 }
 
+/// Codings the client build may have precompressed a file into, best first,
+/// with the extension of the sibling that holds each.
+const PRECOMPRESSED: [(&str, &str); 2] = [("br", "br"), ("gzip", "gz")];
+
+/// The precompressed siblings of `path` (`Online.js.br`, `Online.js.gz`) that
+/// are regular files no older than it, in preference order.  A stale sibling
+/// is a build that did not finish, and serving it would serve old code.
+async fn fresh_siblings(
+    path: &FsPath,
+    modified: SystemTime,
+) -> Vec<(PathBuf, &'static str, &'static str)> {
+    // `/Online.js.br` asked for by name is just a file, not a representation.
+    let ext = extension_of(&path.to_string_lossy());
+    if PRECOMPRESSED.iter().any(|(_, sibling)| *sibling == ext) {
+        return Vec::new();
+    }
+
+    let mut fresh = Vec::new();
+    for (coding, sibling_ext) in PRECOMPRESSED {
+        let mut sibling = path.as_os_str().to_owned();
+        sibling.push(".");
+        sibling.push(sibling_ext);
+        let sibling = PathBuf::from(sibling);
+        let Ok(meta) = tokio::fs::metadata(&sibling).await else {
+            continue;
+        };
+        let sibling_modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if meta.is_file() && sibling_modified >= modified {
+            fresh.push((sibling, coding, sibling_ext));
+        }
+    }
+    fresh
+}
+
 /// Serve a file out of `ROBROWSER_PATH`.  Returns `None` when there is nothing
 /// there, so the request can fall through to asset resolution.
+///
+/// When the build left a fresh `.br` or `.gz` beside the file and the client
+/// accepts that coding, its bytes go out as they are, instead of gzipping a
+/// 13 MB `Online.js` at level 1 on every request.  Each representation has its
+/// own ETag, so a conditional request revalidates the bytes it actually holds.
 async fn serve_static(state: &AppState, headers: &HeaderMap, relative: &str) -> Option<Response> {
     let base = &state.cfg.robrowser_path;
     let candidate = safe_join(base, relative)?;
@@ -409,22 +451,69 @@ async fn serve_static(state: &AppState, headers: &HeaderMap, relative: &str) -> 
         (candidate, metadata)
     };
 
-    // Weak validator built from size and mtime, the same shape `express.static`
-    // sends, so an existing browser cache stays valid across the swap.
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let etag = weak_etag(metadata.len(), modified);
+    let siblings = if state.cfg.enable_compression {
+        fresh_siblings(&path, modified).await
+    } else {
+        Vec::new()
+    };
+    // With a sibling on disk the response depends on Accept-Encoding whichever
+    // representation is chosen, so every answer for this path says so.
+    let varies = !siblings.is_empty();
+    let chosen = siblings
+        .into_iter()
+        .find(|(_, coding, _)| http::accepts_encoding(headers, coding));
+
+    // Weak validator built from size and mtime, the same shape `express.static`
+    // sends, so an existing browser cache stays valid across the swap.  A
+    // precompressed representation tags it with its coding.
+    let suffix = chosen
+        .as_ref()
+        .map(|(_, _, ext)| format!("-{ext}"))
+        .unwrap_or_default();
+    let etag = weak_etag(metadata.len(), modified, &suffix);
     let last_modified = httpdate::fmt_http_date(modified);
 
     if etag_matches_weak(headers, &etag) || not_modified_since(headers, modified) {
-        return Some(
-            Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(ETAG, &etag)
-                .header(LAST_MODIFIED, &last_modified)
-                .header(CACHE_CONTROL, "public, max-age=0")
-                .body(Body::empty())
-                .unwrap(),
-        );
+        let mut builder = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(ETAG, &etag)
+            .header(LAST_MODIFIED, &last_modified)
+            .header(CACHE_CONTROL, "public, max-age=0");
+        if varies {
+            builder = builder.header(VARY, "Accept-Encoding");
+        }
+        return Some(builder.body(Body::empty()).unwrap());
+    }
+
+    let ext = extension_of(&path.to_string_lossy());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, http::content_type_for(&ext))
+        .header(ETAG, &etag)
+        .header(LAST_MODIFIED, &last_modified)
+        .header(CACHE_CONTROL, "public, max-age=0");
+    if varies {
+        builder = builder.header(VARY, "Accept-Encoding");
+    }
+
+    if let Some((sibling, coding, _)) = &chosen {
+        match tokio::fs::read(sibling).await {
+            Ok(content) => {
+                return Some(
+                    builder
+                        .header(CONTENT_ENCODING, *coding)
+                        .body(Body::from(content))
+                        .unwrap(),
+                );
+            }
+            Err(e) => {
+                // The ETag already names this representation, so a failed read
+                // cannot quietly become a different one under the same tag.
+                warn!("Static read failed for {}: {e}", sibling.display());
+                return None;
+            }
+        }
     }
 
     let content = match tokio::fs::read(&path).await {
@@ -435,30 +524,20 @@ async fn serve_static(state: &AppState, headers: &HeaderMap, relative: &str) -> 
         }
     };
 
-    let ext = extension_of(&path.to_string_lossy());
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, http::content_type_for(&ext))
-        .header(ETAG, &etag)
-        .header(LAST_MODIFIED, &last_modified)
-        .header(CACHE_CONTROL, "public, max-age=0")
-        .body(Body::empty())
-        .unwrap();
-
     Some(http::maybe_compress(
         headers,
-        response,
+        builder.body(Body::empty()).unwrap(),
         content,
         state.cfg.enable_compression,
     ))
 }
 
-fn weak_etag(len: u64, modified: SystemTime) -> String {
+fn weak_etag(len: u64, modified: SystemTime, suffix: &str) -> String {
     let millis = modified
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("W/\"{len:x}-{millis:x}\"")
+    format!("W/\"{len:x}-{millis:x}{suffix}\"")
 }
 
 fn etag_matches_weak(headers: &HeaderMap, etag: &str) -> bool {

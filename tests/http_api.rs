@@ -528,6 +528,264 @@ async fn static_serving_refuses_to_escape_the_bundle() {
     let _ = std::fs::remove_file(bundle.path.parent().unwrap().join("outside.txt"));
 }
 
+/// A static bundle holding `Online.js` (big enough that on-the-fly gzip would
+/// kick in) and whichever precompressed siblings the test writes.
+async fn precompressed_server(enable_compression: &str) -> (TempDir, TempDir, TestServer, Vec<u8>) {
+    let dir = TempDir::new("http-precompressed");
+    GrfBuilder::new()
+        .file("data\\x.txt", b"x")
+        .write_v200(&dir.join("resources/data.grf"));
+    write_data_ini(&dir.path, &["data.grf"]);
+
+    let bundle = TempDir::new("bundle-precompressed");
+    let original = b"console.log('client');\n".repeat(200);
+    bundle.write("Online.js", &original);
+
+    let overrides = [
+        ("ENABLE_STATIC_SERVE", "true"),
+        ("ENABLE_COMPRESSION", enable_compression),
+        ("ROBROWSER_PATH", bundle.path.to_str().unwrap()),
+    ];
+    let client = client_for(&dir.path, &overrides);
+    let cfg = config_for(&dir.path, &overrides);
+    let server = TestServer::start(cfg, client, json!({})).await;
+    (dir, bundle, server, original)
+}
+
+/// Set a file's mtime relative to now, so freshness does not depend on how
+/// quickly the test wrote its files.
+fn set_age(path: &std::path::Path, seconds_ago: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[tokio::test]
+async fn a_fresh_br_sibling_is_served_to_a_client_that_accepts_br() {
+    let (_dir, bundle, server, _) = precompressed_server("true").await;
+    // `request` does not decode brotli, so these bytes come back verbatim.
+    bundle.write("Online.js.br", b"pretend brotli");
+    bundle.write("Online.js.gz", &gzip_bytes(b"from the gz sibling"));
+    set_age(&bundle.join("Online.js"), 60);
+    set_age(&bundle.join("Online.js.br"), 30);
+    set_age(&bundle.join("Online.js.gz"), 30);
+
+    let response = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("Accept-Encoding", "gzip, deflate, br")],
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-encoding"), Some("br"));
+    assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert_eq!(response.header("cache-control"), Some("public, max-age=0"));
+    assert!(response.header("etag").unwrap().ends_with("-br\""));
+    assert_eq!(response.body, b"pretend brotli");
+
+    let head = request(
+        server.addr,
+        "HEAD",
+        "/Online.js",
+        &[("Accept-Encoding", "br")],
+        None,
+    )
+    .await;
+    assert_eq!(head.status, 200);
+    assert_eq!(head.header("content-encoding"), Some("br"));
+    assert!(head.body.is_empty());
+}
+
+#[tokio::test]
+async fn gzip_falls_back_to_the_gz_sibling_and_br_q0_is_a_refusal() {
+    let (_dir, bundle, server, _) = precompressed_server("true").await;
+    bundle.write("Online.js.br", b"pretend brotli");
+    bundle.write("Online.js.gz", &gzip_bytes(b"from the gz sibling"));
+    set_age(&bundle.join("Online.js"), 60);
+    set_age(&bundle.join("Online.js.br"), 30);
+    set_age(&bundle.join("Online.js.gz"), 30);
+
+    for accept in ["gzip, deflate", "br;q=0, gzip"] {
+        let response = request(
+            server.addr,
+            "GET",
+            "/Online.js",
+            &[("Accept-Encoding", accept)],
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.header("content-encoding"),
+            Some("gzip"),
+            "{accept}"
+        );
+        assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+        assert!(response.header("etag").unwrap().ends_with("-gz\""));
+        // `request` gunzips, so this proves the sibling went out, not a fresh
+        // compression of the original.
+        assert_eq!(response.body, b"from the gz sibling", "{accept}");
+    }
+}
+
+#[tokio::test]
+async fn a_stale_sibling_is_ignored() {
+    let (_dir, bundle, server, original) = precompressed_server("true").await;
+    bundle.write("Online.js.br", b"stale brotli");
+    set_age(&bundle.join("Online.js.br"), 120);
+    set_age(&bundle.join("Online.js"), 60);
+
+    let response = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("Accept-Encoding", "gzip, br")],
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    // Today's on-the-fly gzip of the original, under the original's tag.
+    assert_eq!(response.header("content-encoding"), Some("gzip"));
+    assert_eq!(response.body, original);
+    let etag = response.header("etag").unwrap();
+    assert!(
+        !etag.ends_with("-br\"") && !etag.ends_with("-gz\""),
+        "{etag}"
+    );
+}
+
+#[tokio::test]
+async fn without_accept_encoding_or_with_compression_off_the_original_is_served() {
+    let (_dir, bundle, server, original) = precompressed_server("true").await;
+    bundle.write("Online.js.br", b"pretend brotli");
+    set_age(&bundle.join("Online.js"), 60);
+    set_age(&bundle.join("Online.js.br"), 30);
+
+    let response = request(server.addr, "GET", "/Online.js", &[], None).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-encoding"), None);
+    assert_eq!(response.body, original);
+    let etag = response.header("etag").unwrap();
+    assert!(
+        etag.starts_with("W/\"") && !etag.ends_with("-br\""),
+        "{etag}"
+    );
+    // The answer would have differed for a br client, so caches are told.
+    assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+
+    // Asked for by name, the sibling is just a file.
+    let direct = request(
+        server.addr,
+        "GET",
+        "/Online.js.br",
+        &[("Accept-Encoding", "br")],
+        None,
+    )
+    .await;
+    assert_eq!(direct.header("content-encoding"), None);
+    assert_eq!(direct.body, b"pretend brotli");
+
+    let (_dir, bundle, server, original) = precompressed_server("false").await;
+    bundle.write("Online.js.br", b"pretend brotli");
+    set_age(&bundle.join("Online.js"), 60);
+    set_age(&bundle.join("Online.js.br"), 30);
+    let response = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("Accept-Encoding", "br, gzip")],
+        None,
+    )
+    .await;
+    assert_eq!(response.header("content-encoding"), None);
+    assert_eq!(response.header("vary"), None);
+    assert_eq!(response.body, original);
+}
+
+#[tokio::test]
+async fn each_representation_revalidates_against_its_own_etag() {
+    let (_dir, bundle, server, _) = precompressed_server("true").await;
+    bundle.write("Online.js.br", b"pretend brotli");
+    set_age(&bundle.join("Online.js"), 60);
+    set_age(&bundle.join("Online.js.br"), 30);
+
+    let br = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("Accept-Encoding", "br")],
+        None,
+    )
+    .await;
+    let br_etag = br.header("etag").unwrap().to_string();
+    let plain = request(server.addr, "GET", "/Online.js", &[], None).await;
+    let plain_etag = plain.header("etag").unwrap().to_string();
+    assert_ne!(br_etag, plain_etag);
+    assert_eq!(br.header("last-modified"), plain.header("last-modified"));
+
+    // The br tag revalidates the br representation...
+    let cached = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("Accept-Encoding", "br"), ("If-None-Match", &br_etag)],
+        None,
+    )
+    .await;
+    assert_eq!(cached.status, 304);
+    assert!(cached.body.is_empty());
+    assert_eq!(cached.header("etag"), Some(br_etag.as_str()));
+    assert_eq!(cached.header("vary"), Some("Accept-Encoding"));
+
+    // ...but not the identity one, and the identity tag not the br one.
+    let mismatched = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("If-None-Match", &br_etag)],
+        None,
+    )
+    .await;
+    assert_eq!(mismatched.status, 200);
+    let mismatched = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("Accept-Encoding", "br"), ("If-None-Match", &plain_etag)],
+        None,
+    )
+    .await;
+    assert_eq!(mismatched.status, 200);
+    assert_eq!(mismatched.body, b"pretend brotli");
+
+    let cached = request(
+        server.addr,
+        "GET",
+        "/Online.js",
+        &[("If-None-Match", &plain_etag)],
+        None,
+    )
+    .await;
+    assert_eq!(cached.status, 304);
+    assert_eq!(cached.header("etag"), Some(plain_etag.as_str()));
+}
+
 #[tokio::test]
 async fn cors_reflects_a_known_origin_and_ignores_others() {
     let (_dir, server) = server(&[]).await;
