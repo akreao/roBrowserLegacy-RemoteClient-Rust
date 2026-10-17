@@ -8,6 +8,8 @@ use robrowser_remoteclient::encoding::to_mojibake;
 use support::{client_for, write_data_ini, GrfBuilder, TempDir};
 
 const KOREAN: &str = "data\\sprite\\인간족\\검사\\검사_남_1460.act";
+/// 웤 is 0x9F 0x70 in CP949: a lead byte in the 0x80..=0x9F range.
+const UHC: &str = "data\\texture\\유저인터페이스\\item\\웤웤망토.bmp";
 
 #[test]
 fn selected_client_directories_are_scoped_read_only_fallbacks() {
@@ -143,6 +145,7 @@ fn fixture() -> TempDir {
         .file("data\\shared.txt", b"from base")
         .file("data\\only-base.txt", b"base only")
         .file(KOREAN, b"korean payload")
+        .file(UHC, b"manteau payload")
         .write_v200(&dir.join("resources/data.grf"));
     write_data_ini(&dir.path, &["custom.grf", "data.grf"]);
     dir
@@ -233,6 +236,28 @@ fn all_four_spellings_resolve_to_the_same_bytes() {
         etags.push(file.etag.to_string());
     }
     assert!(etags.windows(2).all(|w| w[0] == w[1]));
+}
+
+/// roBrowser decodes the client's tables as windows-1252, not ISO-8859-1, so
+/// a CP949 byte in 0x80..=0x9F reaches us as a windows-1252 letter (0x9F is
+/// `Ÿ`, U+0178) instead of the C1 control the mojibake spelling expects.
+#[test]
+fn a_windows_1252_spelling_of_a_cp949_byte_still_resolves() {
+    let dir = fixture();
+    let client = client_for(&dir.path, &[]);
+
+    let latin1 = to_mojibake(&UHC.replace('\\', "/"));
+    let cp1252: String = latin1
+        .chars()
+        .map(|c| if c == '\u{9F}' { '\u{178}' } else { c })
+        .collect();
+    assert_ne!(cp1252, latin1);
+    assert!(cp1252.contains("ŸpŸp"));
+
+    let (file, _) = client
+        .resolve(&cp1252)
+        .unwrap_or_else(|| panic!("no hit for {cp1252}"));
+    assert_eq!(&*file.data, b"manteau payload");
 }
 
 #[test]

@@ -51,6 +51,59 @@ pub fn utf8_decode_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// The 27 characters windows-1252 puts in 0x80..=0x9F, with their byte.
+const WINDOWS_1252_HIGH: [(char, u8); 27] = [
+    ('\u{20AC}', 0x80),
+    ('\u{201A}', 0x82),
+    ('\u{0192}', 0x83),
+    ('\u{201E}', 0x84),
+    ('\u{2026}', 0x85),
+    ('\u{2020}', 0x86),
+    ('\u{2021}', 0x87),
+    ('\u{02C6}', 0x88),
+    ('\u{2030}', 0x89),
+    ('\u{0160}', 0x8A),
+    ('\u{2039}', 0x8B),
+    ('\u{0152}', 0x8C),
+    ('\u{017D}', 0x8E),
+    ('\u{2018}', 0x91),
+    ('\u{2019}', 0x92),
+    ('\u{201C}', 0x93),
+    ('\u{201D}', 0x94),
+    ('\u{2022}', 0x95),
+    ('\u{2013}', 0x96),
+    ('\u{2014}', 0x97),
+    ('\u{02DC}', 0x98),
+    ('\u{2122}', 0x99),
+    ('\u{0161}', 0x9A),
+    ('\u{203A}', 0x9B),
+    ('\u{0153}', 0x9C),
+    ('\u{017E}', 0x9E),
+    ('\u{0178}', 0x9F),
+];
+
+/// Turn a windows-1252 spelling into the ISO-8859-1 one, or `None` when the
+/// string has none of windows-1252's own characters.
+///
+/// roBrowser decodes the client's tables as windows-1252 (WHATWG's
+/// `iso-8859-1` is windows-1252 too), so a CP949 byte in 0x80..=0x9F, a lead
+/// byte of many UHC syllables such as 웤 (0x9F 0x70), arrives as `Ÿ` rather
+/// than U+009F, and the mojibake spelling no longer matches the archive.
+pub fn windows1252_to_latin1(s: &str) -> Option<String> {
+    let mut changed = false;
+    let out = s
+        .chars()
+        .map(|c| match WINDOWS_1252_HIGH.iter().find(|(w, _)| *w == c) {
+            Some(&(_, b)) => {
+                changed = true;
+                b as char
+            }
+            None => c,
+        })
+        .collect();
+    changed.then_some(out)
+}
+
 /// `ÀÎ°£Á·` -> `인간족`.  Reverses the client's mojibake spelling.
 pub fn decode_mojibake(s: &str) -> String {
     cp949_decode(&latin1_encode(s))
@@ -167,6 +220,27 @@ mod tests {
         // The single most-requested Korean directory in the client.
         assert_eq!(to_mojibake("유저인터페이스"), "À¯ÀúÀÎÅÍÆäÀÌ½º");
         assert_eq!(decode_mojibake("À¯ÀúÀÎÅÍÆäÀÌ½º"), "유저인터페이스");
+    }
+
+    #[test]
+    fn windows_1252_letters_go_back_to_their_bytes() {
+        // 웤웤망토 as roBrowser spells it: 0x9F read as windows-1252.
+        let requested = "ŸpŸp¸ÁÅä";
+        let latin1 = windows1252_to_latin1(requested).unwrap();
+        assert_eq!(latin1, to_mojibake("웤웤망토"));
+        assert_eq!(decode_mojibake(&latin1), "웤웤망토");
+        // Every windows-1252 letter maps back to its own byte.
+        for &(c, b) in WINDOWS_1252_HIGH.iter() {
+            let byte = [b];
+            let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(&byte);
+            assert_eq!(decoded.chars().next(), Some(c));
+        }
+    }
+
+    #[test]
+    fn plain_mojibake_needs_no_windows_1252_fix() {
+        assert_eq!(windows1252_to_latin1(&to_mojibake("유저인터페이스")), None);
+        assert_eq!(windows1252_to_latin1("data/sprite/test.spr"), None);
     }
 
     #[test]
