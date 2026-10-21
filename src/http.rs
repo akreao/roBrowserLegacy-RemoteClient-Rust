@@ -2,6 +2,7 @@
 //! compression and CORS.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::header::{
@@ -11,6 +12,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
@@ -126,16 +128,21 @@ pub fn accepts_encoding(headers: &HeaderMap, coding: &str) -> bool {
 }
 
 /// A content coding the server makes for game assets.
+///
+/// Gzip only.  Brotli was tried for clients that offer it (the HTTPS sharing
+/// tunnel): it sent about 9% less than kept gzip-6 over a replayed game
+/// session, but its encoder's scratch memory raised the server's peak RSS by
+/// 250-350 MB on macOS, where the allocator returns freed pages lazily.
+/// Prebuilt `.br` siblings of the client files cost no encoding and are
+/// still served (see `serve_static`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coding {
-    Br,
     Gzip,
 }
 
 impl Coding {
     pub fn name(self) -> &'static str {
         match self {
-            Coding::Br => "br",
             Coding::Gzip => "gzip",
         }
     }
@@ -145,11 +152,6 @@ impl Coding {
 /// it is paid once per file rather than once per request: level 6 makes the
 /// `.lub` tables about a third smaller than level 1, at about 60 MB/s.
 const ASSET_GZIP_LEVEL: u32 = 6;
-/// Brotli quality and window for game assets.  Quality 5 is where brotli
-/// stops getting much smaller for what it costs: half the size of level-1
-/// gzip on the text tables, at about the speed of gzip level 6.
-const ASSET_BROTLI_QUALITY: u32 = 5;
-const ASSET_BROTLI_WINDOW: u32 = 22;
 
 /// True when `path` is a game asset worth compressing, so its answer depends
 /// on `Accept-Encoding` whether or not this client gets it compressed.
@@ -161,7 +163,6 @@ pub fn negotiates_coding(path: &str, len: usize, compression_enabled: bool) -> b
 }
 
 /// The coding to send `path` in, or `None` for its bytes as they are.
-/// Browsers offer `br` only over HTTPS, so a player on the LAN gets gzip.
 pub fn asset_coding(
     request_headers: &HeaderMap,
     path: &str,
@@ -171,33 +172,24 @@ pub fn asset_coding(
     if !negotiates_coding(path, len, compression_enabled) {
         return None;
     }
-    [Coding::Br, Coding::Gzip]
+    [Coding::Gzip]
         .into_iter()
         .find(|coding| accepts_encoding(request_headers, coding.name()))
 }
 
 /// `data` in `coding`, or `None` when that is not smaller.  Tens of
 /// milliseconds for a large table, so call it off the async workers.
-pub fn encode_asset(coding: Coding, data: &[u8]) -> Option<Vec<u8>> {
+///
+/// `kept` says the result is stored with the cached file.  A file too big to
+/// cache is encoded again for every request, so it gets the cheapest
+/// settings instead (gzip level 1, as before encodings were kept).
+pub fn encode_asset(coding: Coding, data: &[u8], kept: bool) -> Option<Vec<u8>> {
     let encoded = match coding {
         Coding::Gzip => {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(ASSET_GZIP_LEVEL));
+            let level = if kept { ASSET_GZIP_LEVEL } else { 1 };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
             encoder.write_all(data).ok()?;
             encoder.finish().ok()?
-        }
-        Coding::Br => {
-            let mut out = Vec::new();
-            {
-                let mut writer = brotli::CompressorWriter::new(
-                    &mut out,
-                    4096,
-                    ASSET_BROTLI_QUALITY,
-                    ASSET_BROTLI_WINDOW,
-                );
-                writer.write_all(data).ok()?;
-                writer.flush().ok()?;
-            }
-            out
         }
     };
     (encoded.len() < data.len()).then_some(encoded)
@@ -224,18 +216,39 @@ pub fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|candidate| candidate == quoted || candidate == "*")
 }
 
+/// The ETag of a file's body in `coding`.  Each representation has its own,
+/// so a cache that revalidates one never gets a 304 meant for another.
+pub fn coded_etag(etag: &str, coding: Option<Coding>) -> String {
+    match coding {
+        Some(Coding::Gzip) => format!("{etag}-gz"),
+        None => etag.to_string(),
+    }
+}
+
+/// Bytes kept in the cache, handed to a response body without a copy.
+pub fn shared_body(data: Arc<Vec<u8>>) -> Bytes {
+    struct Shared(Arc<Vec<u8>>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    Bytes::from_owner(Shared(data))
+}
+
 /// Build the response for a resolved asset, honouring conditional requests.
 ///
-/// `encoded` is the body already in the coding [`asset_coding`] chose, when
-/// that came out smaller; `vary` is [`negotiates_coding`], so a cache keeps
-/// the encoded and plain bodies apart even when this one is plain.
+/// `body` is already in `coding` (`None` for the bytes as they are), and
+/// `etag` is that representation's tag ([`coded_etag`]).  `vary` is
+/// [`negotiates_coding`], so a cache keeps the encoded and plain bodies
+/// apart even when this one is plain.
 pub fn asset_response(
     request_headers: &HeaderMap,
     path: &str,
-    data: &[u8],
+    body: Bytes,
     etag: Option<&str>,
     vary: bool,
-    encoded: Option<(Coding, &[u8])>,
+    coding: Option<Coding>,
 ) -> Response {
     let ext = extension_of(path);
     let content_type = content_type_for(&ext);
@@ -244,7 +257,13 @@ pub fn asset_response(
     if is_static {
         if let Some(etag) = etag {
             if etag_matches(request_headers, etag) {
-                return not_modified(etag);
+                let mut response = not_modified(etag);
+                if vary {
+                    response
+                        .headers_mut()
+                        .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+                }
+                return response;
             }
         }
     }
@@ -273,18 +292,15 @@ pub fn asset_response(
     if vary {
         builder = builder.header(VARY, "Accept-Encoding");
     }
-    match encoded {
-        Some((coding, body)) => builder
-            .header(CONTENT_ENCODING, coding.name())
-            .body(Body::from(body.to_vec()))
-            .unwrap(),
-        None => builder.body(Body::from(data.to_vec())).unwrap(),
+    if let Some(coding) = coding {
+        builder = builder.header(CONTENT_ENCODING, coding.name());
     }
+    builder.body(Body::from(body)).unwrap()
 }
 
 /// The compact form of a picture (compact.rs), for a request that asked for
 /// it.  Cached like the original, under its own ETag.
-pub fn compact_response(etag: &str, body: &[u8]) -> Response {
+pub fn compact_response(etag: &str, body: Arc<Vec<u8>>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "image/webp")
@@ -298,7 +314,7 @@ pub fn compact_response(etag: &str, body: &[u8]) -> Response {
             httpdate::fmt_http_date(std::time::SystemTime::now()),
         )
         .header(VARY, "Accept-Encoding, X-Compact-Images")
-        .body(Body::from(body.to_vec()))
+        .body(Body::from(shared_body(body)))
         .unwrap()
 }
 

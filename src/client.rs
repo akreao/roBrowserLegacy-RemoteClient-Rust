@@ -4,11 +4,11 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use crate::cache::{CacheStats, CachedFile, Encodings, FileCache};
+use crate::cache::{CacheStats, CachedFile, FileCache};
 use crate::compact;
 use crate::config::Config;
 use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake, windows1252_to_latin1};
@@ -239,63 +239,83 @@ impl Client {
 
     /// `file`'s bytes in `coding`, made once and kept with the cached entry;
     /// `None` when that coding does not make it smaller.
+    ///
+    /// A file the cache would not keep (over a tenth of its budget) has
+    /// nowhere to keep an encoding either, so it is encoded cheaply for each
+    /// request instead, as every asset was before encodings were kept.
+    ///
+    /// Which settings a file gets depends on its size alone, never on whether
+    /// this copy is still the cached one, so a coding's ETag always names the
+    /// same bytes.  Concurrent first requests each insert the file, and all
+    /// but the last hold a copy the cache has already replaced: those encode
+    /// at the kept settings too, and `add_encoding` counts nothing for them.
     pub async fn encoded(
         self: &Arc<Self>,
         req_path: &str,
         file: &CachedFile,
         coding: Coding,
     ) -> Option<Arc<Vec<u8>>> {
-        self.made(
-            req_path,
-            file,
-            move |e| e.slot(coding),
-            move |data| encode_asset(coding, data),
-        )
+        if let Some(done) = file.encodings.slot(coding).get() {
+            return done.clone();
+        }
+        let this = Arc::clone(self);
+        let key = Self::cache_key(req_path);
+        let file = file.clone();
+        if !self.cache.keeps(file.data.len()) {
+            return tokio::task::spawn_blocking(move || {
+                encode_asset(coding, &file.data, false).map(Arc::new)
+            })
+            .await
+            .unwrap_or(None);
+        }
+        tokio::task::spawn_blocking(move || {
+            let mut made = None;
+            let result = file
+                .encodings
+                .slot(coding)
+                .get_or_init(|| {
+                    let encoded = encode_asset(coding, &file.data, true).map(Arc::new);
+                    made = encoded.as_ref().map(|e| e.len());
+                    encoded
+                })
+                .clone();
+            if let Some(bytes) = made {
+                this.cache.add_encoding(&key, &file, bytes);
+            }
+            result
+        })
         .await
+        .unwrap_or(None)
     }
 
     /// `file` as a compact picture (compact.rs), made once and kept with the
-    /// cached entry like an encoding; `None` when that is not smaller.
+    /// cached entry like an encoding; `None` when that is not smaller.  A file
+    /// the cache would not keep is transcoded for each request, as `encoded`
+    /// does for its codings.
     pub async fn compacted(
         self: &Arc<Self>,
         req_path: &str,
         file: &CachedFile,
         quality: u8,
     ) -> Option<Arc<Vec<u8>>> {
-        let path = req_path.to_string();
-        self.made(
-            req_path,
-            file,
-            |e| &e.compact,
-            move |data| compact::transcode(&path, data, quality),
-        )
-        .await
-    }
-
-    /// Fill one of `file`'s derived forms with `make` on the blocking pool,
-    /// once, and count it against the cache's memory budget.
-    async fn made<S, M>(
-        self: &Arc<Self>,
-        req_path: &str,
-        file: &CachedFile,
-        slot: S,
-        make: M,
-    ) -> Option<Arc<Vec<u8>>>
-    where
-        S: Fn(&Encodings) -> &OnceLock<Option<Arc<Vec<u8>>>> + Send + 'static,
-        M: FnOnce(&[u8]) -> Option<Vec<u8>> + Send + 'static,
-    {
-        if let Some(done) = slot(&file.encodings).get() {
+        if let Some(done) = file.encodings.compact.get() {
             return done.clone();
         }
         let this = Arc::clone(self);
+        let path = req_path.to_string();
         let key = Self::cache_key(req_path);
         let file = file.clone();
+        let keep = self.cache.keeps(file.data.len());
         tokio::task::spawn_blocking(move || {
+            if !keep {
+                return compact::transcode(&path, &file.data, quality).map(Arc::new);
+            }
             let mut made = None;
-            let result = slot(&file.encodings)
+            let result = file
+                .encodings
+                .compact
                 .get_or_init(|| {
-                    let bytes = make(&file.data).map(Arc::new);
+                    let bytes = compact::transcode(&path, &file.data, quality).map(Arc::new);
                     made = bytes.as_ref().map(|b| b.len());
                     bytes
                 })

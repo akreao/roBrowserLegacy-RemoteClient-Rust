@@ -1,6 +1,6 @@
 [package]
 name = "robrowser-remoteclient"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 rust-version = "1.88"
 description = "Single-binary roBrowserLegacy Remote Client: static server, GRF asset server and WebSocket-to-TCP proxy"
@@ -34,13 +34,13 @@ httpdate = "1"
 # potentially reused control port. Use audited primitives, not custom crypto.
 hmac = "0.12"
 sha2 = "0.10"
-# Brotli for game assets sent through the HTTPS sharing tunnel, where
-# browsers offer it. Pure Rust, like flate2's backend.
-brotli = { version = "8", default-features = false, features = ["std"] }
 # Smaller pictures for players on a slow link (src/compact.rs): BMP and JPEG
 # decoders, and libwebp's lossy encoder, built from the source it bundles.
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
 webp = { version = "0.3", default-features = false }
+aes = "0.8.4"
+xxhash-rust = { version = "0.8.15", features = ["xxh32", "xxh3"] }
+lz4_flex = { version = "0.10.0", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "fs"] }
@@ -54,3 +54,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# The WebP encoder raised rust-version to 1.88, which switches these two on
+# across code written for 1.75. Rewriting the GRF ciphers' block loops for a
+# lint would only make the next upstream merge harder.
+[lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+manual_is_multiple_of = "allow"

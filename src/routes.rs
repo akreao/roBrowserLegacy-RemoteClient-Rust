@@ -356,35 +356,34 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
                 state.cfg.enable_compression,
             );
             // A revalidation that will be answered 304 needs no body made.
-            let revalidating = http::is_static_extension(&extension_of(&relative))
-                && http::etag_matches(&headers, &file.etag);
-            let encoded = match coding {
-                Some(coding) if !revalidating => state
-                    .client
-                    .encoded(&relative, &file, coding)
-                    .await
-                    .map(|body| (coding, body)),
-                _ => None,
+            let revalidating = |coding| {
+                http::is_static_extension(&extension_of(&relative))
+                    && http::etag_matches(&headers, &http::coded_etag(&file.etag, coding))
             };
-            if compact && !revalidating {
-                if let Some(body) = state.client.compacted(&relative, &file, quality).await {
-                    // Brotli can still win on a small, flat picture.
-                    let sent = encoded.as_ref().map_or(file.data.len(), |(_, b)| b.len());
-                    if body.len() < sent {
+            let (coding, body) = match coding {
+                Some(coding) if revalidating(Some(coding)) => (Some(coding), bytes::Bytes::new()),
+                Some(coding) => match state.client.encoded(&relative, &file, coding).await {
+                    Some(encoded) => (Some(coding), http::shared_body(encoded)),
+                    None => (None, http::shared_body(file.data.clone())),
+                },
+                None => (None, http::shared_body(file.data.clone())),
+            };
+            if compact && !revalidating(coding) {
+                if let Some(picture) = state.client.compacted(&relative, &file, quality).await {
+                    // Gzip can still win on a small, flat picture.
+                    if picture.len() < body.len() {
                         let etag = compact::etag(&file.etag, quality);
-                        return finish(http::compact_response(&etag, &body), is_head);
+                        return finish(http::compact_response(&etag, picture), is_head);
                     }
                 }
             }
             let response = http::asset_response(
                 &headers,
                 &relative,
-                &file.data,
-                Some(&file.etag),
+                body,
+                Some(&http::coded_etag(&file.etag, coding)),
                 http::negotiates_coding(&relative, file.data.len(), state.cfg.enable_compression),
-                encoded
-                    .as_ref()
-                    .map(|(coding, body)| (*coding, body.as_slice())),
+                coding,
             );
             finish(response, is_head)
         }
