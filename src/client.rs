@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 
 use crate::cache::{CacheStats, CachedFile, FileCache};
+use crate::compact;
 use crate::config::Config;
 use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake, windows1252_to_latin1};
 use crate::grf::Grf;
@@ -276,6 +277,47 @@ impl Client {
                     let encoded = encode_asset(coding, &file.data, true).map(Arc::new);
                     made = encoded.as_ref().map(|e| e.len());
                     encoded
+                })
+                .clone();
+            if let Some(bytes) = made {
+                this.cache.add_encoding(&key, &file, bytes);
+            }
+            result
+        })
+        .await
+        .unwrap_or(None)
+    }
+
+    /// `file` as a compact picture (compact.rs), made once and kept with the
+    /// cached entry like an encoding; `None` when that is not smaller.  A file
+    /// the cache would not keep is transcoded for each request, as `encoded`
+    /// does for its codings.
+    pub async fn compacted(
+        self: &Arc<Self>,
+        req_path: &str,
+        file: &CachedFile,
+        quality: u8,
+    ) -> Option<Arc<Vec<u8>>> {
+        if let Some(done) = file.encodings.compact.get() {
+            return done.clone();
+        }
+        let this = Arc::clone(self);
+        let path = req_path.to_string();
+        let key = Self::cache_key(req_path);
+        let file = file.clone();
+        let keep = self.cache.keeps(file.data.len());
+        tokio::task::spawn_blocking(move || {
+            if !keep {
+                return compact::transcode(&path, &file.data, quality).map(Arc::new);
+            }
+            let mut made = None;
+            let result = file
+                .encodings
+                .compact
+                .get_or_init(|| {
+                    let bytes = compact::transcode(&path, &file.data, quality).map(Arc::new);
+                    made = bytes.as_ref().map(|b| b.len());
+                    bytes
                 })
                 .clone();
             if let Some(bytes) = made {
