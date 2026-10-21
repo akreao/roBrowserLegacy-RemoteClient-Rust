@@ -77,6 +77,7 @@ async fn server(overrides: &[(&str, &str)]) -> (TempDir, TestServer) {
     GrfBuilder::new()
         .file("data\\hello.txt", b"hello from the archive")
         .file("data\\big.spr", &vec![0x11u8; 40_000])
+        .file("data\\varied.spr", &varied_bytes(60_000))
         .file(KOREAN, &vec![0x22u8; 3000])
         .file("data\\config.lub", b"return { a = 1 }")
         .write_v200(&dir.join("resources/data.grf"));
@@ -93,6 +94,13 @@ async fn server(overrides: &[(&str, &str)]) -> (TempDir, TestServer) {
     });
     let server = TestServer::start(cfg, client, health).await;
     (dir, server)
+}
+
+/// Bytes gzip level 1 and level 6 encode to different lengths.
+fn varied_bytes(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i * 7919) % 251) as u8 ^ (i / 97) as u8)
+        .collect()
 }
 
 /// Percent-encode a path the way a browser encodes a URL: UTF-8 bytes, with
@@ -226,7 +234,8 @@ async fn a_client_that_does_not_accept_gzip_gets_plain_bytes() {
 }
 
 #[tokio::test]
-async fn a_client_that_offers_br_gets_brotli_and_the_same_bytes_each_time() {
+async fn a_client_that_also_offers_br_gets_gzip_and_the_same_bytes_each_time() {
+    // Game assets are made in gzip only; a browser on HTTPS offers br too.
     let (_dir, server) = server(&[]).await;
     let mut bodies = Vec::new();
     for _ in 0..2 {
@@ -239,15 +248,123 @@ async fn a_client_that_offers_br_gets_brotli_and_the_same_bytes_each_time() {
         )
         .await;
         assert_eq!(response.status, 200);
-        assert_eq!(response.header("content-encoding"), Some("br"));
+        assert_eq!(response.header("content-encoding"), Some("gzip"));
         assert_eq!(response.header("vary"), Some("Accept-Encoding"));
         bodies.push(response.body);
     }
-    // The second answer comes from the encoding kept with the cached file.
+    // The second answer comes from the encoding kept with the cached file;
+    // `request` decodes gzip, so both are the original payload.
     assert_eq!(bodies[0], bodies[1]);
-    let mut decoded = Vec::new();
-    brotli::BrotliDecompress(&mut bodies[0].as_slice(), &mut decoded).unwrap();
-    assert_eq!(decoded, vec![0x11u8; 40_000]);
+    assert_eq!(bodies[0], vec![0x11u8; 40_000]);
+}
+
+#[tokio::test]
+async fn a_client_that_offers_only_br_gets_plain_bytes() {
+    let (_dir, server) = server(&[]).await;
+    let response = request(
+        server.addr,
+        "GET",
+        "/data/big.spr",
+        &[("Accept-Encoding", "br")],
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-encoding"), None);
+    assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+    assert_eq!(response.body.len(), 40_000);
+}
+
+#[tokio::test]
+async fn each_encoding_of_an_asset_has_its_own_etag_and_revalidates_against_it() {
+    let (_dir, server) = server(&[]).await;
+    let get = |headers: Vec<(&'static str, String)>| {
+        let addr = server.addr;
+        async move {
+            let headers: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            request(addr, "GET", "/data/big.spr", &headers, None).await
+        }
+    };
+    let plain = get(vec![]).await;
+    let gzip = get(vec![("Accept-Encoding", "gzip".into())]).await;
+    let tags: Vec<String> = [&plain, &gzip]
+        .iter()
+        .map(|r| r.header("etag").unwrap().to_string())
+        .collect();
+    assert!(tags[1].ends_with("-gz\""), "{}", tags[1]);
+    assert_ne!(tags[0], tags[1]);
+
+    // Each tag revalidates its own representation, with Vary on the 304.
+    for (accept, tag) in [("", &tags[0]), ("gzip", &tags[1])] {
+        let mut headers = vec![("If-None-Match", tag.clone())];
+        if !accept.is_empty() {
+            headers.push(("Accept-Encoding", accept.into()));
+        }
+        let response = get(headers).await;
+        assert_eq!(response.status, 304, "{accept}");
+        assert_eq!(response.header("etag"), Some(tag.as_str()));
+        assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+    }
+    // The plain tag is not a match for the gzip body.
+    let response = get(vec![
+        ("Accept-Encoding", "gzip".into()),
+        ("If-None-Match", tags[0].clone()),
+    ])
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-encoding"), Some("gzip"));
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_get_one_encoding_under_one_etag() {
+    // Each first request inserts the file, so all but the last hold a copy
+    // the cache has replaced.  They must still send the bytes the tag names.
+    let (_dir, server) = server(&[]).await;
+    let addr = server.addr;
+    let responses = futures_util::future::join_all((0..16).map(|_| async move {
+        request(
+            addr,
+            "GET",
+            "/data/varied.spr",
+            &[("Accept-Encoding", "gzip")],
+            None,
+        )
+        .await
+    }))
+    .await;
+    let mut seen = std::collections::BTreeSet::new();
+    for response in &responses {
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header("content-encoding"), Some("gzip"));
+        assert_eq!(response.body, varied_bytes(60_000));
+        seen.insert((
+            response.header("etag").unwrap().to_string(),
+            response.header("content-length").unwrap().to_string(),
+        ));
+    }
+    assert_eq!(seen.len(), 1, "{seen:?}");
+}
+
+#[tokio::test]
+async fn an_asset_too_big_to_cache_is_still_encoded_and_nothing_is_kept() {
+    // A zero budget caches nothing, as for a file over a tenth of the budget.
+    let (_dir, server) = server(&[("CACHE_MAX_MEMORY_MB", "0")]).await;
+    for _ in 0..2 {
+        let response = request(
+            server.addr,
+            "GET",
+            "/data/big.spr",
+            &[("Accept-Encoding", "gzip")],
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header("content-encoding"), Some("gzip"));
+        assert_eq!(response.body, vec![0x11u8; 40_000]);
+    }
+    let stats = request(server.addr, "GET", "/api/cache-stats", &[], None).await;
+    assert_eq!(stats.json()["cache"]["memoryUsedMB"], "0.00");
 }
 
 #[tokio::test]
@@ -336,7 +453,7 @@ async fn list_files_returns_every_indexed_path() {
     );
 
     let files: Vec<String> = serde_json::from_value(response.json()).unwrap();
-    assert_eq!(files.len(), 4);
+    assert_eq!(files.len(), 5);
     assert!(files.contains(&"data\\hello.txt".to_string()));
     assert!(files.contains(&KOREAN.to_string()));
 }
@@ -1218,97 +1335,4 @@ async fn emblems_are_not_forwarded_without_a_loopback_web_server() {
     let (_dir, server) = server(&[("WEB_SERVER_TARGET", "127.0.0.1:9")]).await;
     let response = request(server.addr, "POST", "/emblem/download", &[], Some(b"{}")).await;
     assert_eq!(response.status, 502);
-}
-
-/// A 64x64 24-bit BMP with enough detail that a lossy WebP is much smaller.
-fn noisy_bmp() -> Vec<u8> {
-    let (w, h) = (64u32, 64u32);
-    let mut out = Vec::new();
-    out.extend_from_slice(b"BM");
-    out.extend_from_slice(&(54 + w * h * 3).to_le_bytes());
-    out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&54u32.to_le_bytes());
-    out.extend_from_slice(&40u32.to_le_bytes());
-    out.extend_from_slice(&w.to_le_bytes());
-    out.extend_from_slice(&h.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&24u16.to_le_bytes());
-    out.extend_from_slice(&[0; 24]);
-    for y in 0..h {
-        for x in 0..w {
-            let n = ((x * 7 + y * 13) % 17) as u8;
-            out.extend_from_slice(&[128 + n, (y * 4) as u8, (x * 4) as u8 ^ n]);
-        }
-    }
-    out
-}
-
-async fn picture_server(overrides: &[(&str, &str)]) -> (TempDir, TestServer) {
-    let dir = TempDir::new("compact");
-    GrfBuilder::new()
-        .file("data\\texture\\wall.bmp", &noisy_bmp())
-        .write_v200(&dir.join("resources/data.grf"));
-    write_data_ini(&dir.path, &["data.grf"]);
-    let client = client_for(&dir.path, overrides);
-    let cfg = config_for(&dir.path, overrides);
-    let server = TestServer::start(cfg, client, json!({ "status": "ok" })).await;
-    (dir, server)
-}
-
-#[tokio::test]
-async fn a_request_for_compact_images_gets_a_smaller_webp_with_its_own_etag() {
-    let (_dir, server) = picture_server(&[]).await;
-    let headers = [
-        ("X-Compact-Images", "1"),
-        ("Accept-Encoding", "gzip, deflate, br"),
-    ];
-    let response = request(server.addr, "GET", "/data/texture/wall.bmp", &headers, None).await;
-
-    assert_eq!(response.status, 200);
-    assert_eq!(response.header("content-type"), Some("image/webp"));
-    assert_eq!(response.header("content-encoding"), None);
-    assert_eq!(
-        response.header("vary"),
-        Some("Accept-Encoding, X-Compact-Images")
-    );
-    assert_eq!(&response.body[..4], b"RIFF");
-    assert_eq!(&response.body[8..12], b"WEBP");
-    assert!(response.body.len() < noisy_bmp().len() / 2);
-    let etag = response.header("etag").unwrap().to_string();
-    assert!(etag.ends_with("-w85\""), "{etag}");
-
-    let again = request(
-        server.addr,
-        "GET",
-        "/data/texture/wall.bmp",
-        &[("X-Compact-Images", "1"), ("If-None-Match", &etag)],
-        None,
-    )
-    .await;
-    assert_eq!(again.status, 304);
-    assert_eq!(again.header("etag"), Some(etag.as_str()));
-}
-
-#[tokio::test]
-async fn without_the_header_a_picture_is_sent_exactly() {
-    let (_dir, server) = picture_server(&[]).await;
-    let response = request(server.addr, "GET", "/data/texture/wall.bmp", &[], None).await;
-    assert_eq!(response.status, 200);
-    assert_eq!(response.header("content-type"), Some("image/bmp"));
-    assert_eq!(response.body, noisy_bmp());
-}
-
-#[tokio::test]
-async fn compact_images_can_be_switched_off() {
-    let (_dir, server) = picture_server(&[("COMPACT_IMAGE_QUALITY", "0")]).await;
-    let response = request(
-        server.addr,
-        "GET",
-        "/data/texture/wall.bmp",
-        &[("X-Compact-Images", "1")],
-        None,
-    )
-    .await;
-    assert_eq!(response.header("content-type"), Some("image/bmp"));
-    assert_eq!(response.body, noisy_bmp());
 }

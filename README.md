@@ -25,9 +25,7 @@ cargo build --release
 # target/release/robrowser-remoteclient
 ```
 
-Rust 1.88 or newer, and a C compiler: the WebP encoder for remote players
-(below) is libwebp, which the `libwebp-sys` crate builds from the source it
-bundles. No system libraries.
+Rust 1.75 or newer. No C toolchain, no system libraries, no build script.
 
 ## Running
 
@@ -39,21 +37,18 @@ mkdir -p resources        # put your GRFs and DATA.INI here
 
 `.env.example` documents every setting.
 
-## Smaller pictures for remote players
-
-A request that carries `X-Compact-Images: 1` gets BMPs and JPEGs of 4 KB or
-more as lossy WebP at `COMPACT_IMAGE_QUALITY` (85 by default), when that comes
-out smaller than the original under brotli. Magenta is keyed into a lossless
-alpha channel first, the way the client keys it. About half the bytes of a map's
-textures, for a proxy in front of players on a slow link to ask for. A client
-that does not send the header always gets the exact file.
-
 ## Assets on separate drives
 
 `CLIENT_DATAINI` accepts an absolute private manifest path. Numbered `[Data]`
 entries accept absolute GRF paths, with lower indices taking priority; archives
 are opened in place without file links or copies. Keep the resources directory
 present for startup validation even when its archive entries are all absolute.
+
+Protected version 3 GRFs use their archive key block and original filename
+bytes for decoding. Body ciphers `1`, `5`, `7`, `128` and `133` are supported,
+with descriptor checksums, output-size checks and content hashes verified before
+serving. Unknown formats and damaged protected entries fail explicitly; no game
+executable or extraction step is needed.
 
 `BGM_PATH` and `AI_PATH` provide read-only fallbacks for their respective request
 namespaces. Resolution checks the memory cache, app-owned loose files, the
